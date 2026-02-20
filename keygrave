@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# KEYGRAVE TELEMETRY — Beta Program
+# A Chasm Logic QA Initiative
+#
+# This tool runs locally. It reads ~/.claude/ and prints numbers.
+# Nothing is transmitted. The legalese is decorative. Like Key 3.
+
+VERSION="0.1.0"
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/keygrave"
+STATE_FILE="$STATE_DIR/state"
+
+# ─── Utilities ─────────────────────────────────────────────────────
+
+die() {
+  printf '\n  %s\n\n' "$1" >&2
+  exit 1
+}
+
+progress() {
+  printf '\r  %s' "$1" >&2
+}
+
+clear_progress() {
+  printf '\r%*s\r' 70 '' >&2
+}
+
+# ─── Data discovery ────────────────────────────────────────────────
+
+discover_data() {
+  if [[ ! -d "$CLAUDE_DIR" ]]; then
+    die "Telemetry interrupted. No Claude Code installation detected at $CLAUDE_DIR. Your approval patterns remain unobserved. This is not a reprieve."
+  fi
+
+  HISTORY_FILE="$CLAUDE_DIR/history.jsonl"
+  if [[ ! -f "$HISTORY_FILE" ]]; then
+    HISTORY_ENTRIES=0
+  else
+    HISTORY_ENTRIES=$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)
+  fi
+
+  SESSION_COUNT=0
+  if [[ -d "$CLAUDE_DIR/projects" ]]; then
+    SESSION_COUNT=$(find "$CLAUDE_DIR/projects" -name "*.jsonl" -not -path "*/subagents/*" -type f 2>/dev/null | wc -l)
+  fi
+  PROJECT_COUNT=0
+  if [[ -d "$CLAUDE_DIR/projects" ]]; then
+    PROJECT_COUNT=$(find "$CLAUDE_DIR/projects" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+  fi
+
+  DATA_SIZE="0"
+  if [[ -d "$CLAUDE_DIR/projects" ]]; then
+    DATA_SIZE=$(du -sh "$CLAUDE_DIR/projects" 2>/dev/null | cut -f1)
+  fi
+}
+
+# ─── Awk classification script ─────────────────────────────────────
+# Single awk script handles all text classification — no bash loops needed
+
+AWK_CLASSIFY='
+function classify(text) {
+  # Lowercase, trim
+  text = tolower(text)
+  gsub(/^[ \t]+|[ \t]+$/, "", text)
+  gsub(/[.!,;:"\047]+$/, "", text)
+
+  if (text == "") return "approval"
+  if (text ~ /^\//) return "command"
+  if (text ~ /<command-name>|<local-command|<system-reminder>/) return "meta"
+
+  # Exact approval words
+  if (text ~ /^(y|yes|yep|yeah|yea|yup|ok|okay|sure|go|fine|absolutely|affirmative|lgtm|1|correct|right|perfect|great|good|nice|cool|awesome|k|kk|aye|si|ja|confirmed|approved|accept|agreed|ack|roger|aight|bet|word|ship|yee|ye)$/)
+    return "approval"
+
+  # Approval phrases
+  if (text ~ /^(go ahead|do it|go for it|sounds good|looks good|ship it|lets go|lets continue|lets do it|sure thing|yes please|yes do it|yes go ahead|that works|works for me|all good|no objections|makes sense|do that|try that|run it|send it|push it|merge it|commit it|deploy it|thats fine|thats good|thats correct|thats right|good call|fair enough)$/)
+    return "approval"
+
+  # Exact rejection words
+  if (text ~ /^(n|no|nope|nah|stop|wait|cancel|undo|revert|reject|abort|nein|nay|negative|denied|pass|skip|dont|nvm)$/)
+    return "rejection"
+
+  # Rejection phrases
+  if (text ~ /^(hold on|never mind|nevermind|scratch that|go back|roll back|not yet|not now|stop that|undo that|cancel that|dont do that|wait a moment|hold up|back up|step back|no thanks|no thank you|thats wrong|thats not right)$/)
+    return "rejection"
+
+  return "input"
+}
+'
+
+# ─── Session file parsing ─────────────────────────────────────────
+# Single-pass pipelines — no bash loops, no per-message subshells
+
+parse_sessions() {
+  progress "Scanning approval patterns..."
+
+  # Build file list excluding subagent files
+  local file_list
+  file_list=$(mktemp)
+  find "$CLAUDE_DIR/projects" -name "*.jsonl" -not -path "*/subagents/*" -type f \
+    > "$file_list" 2>/dev/null || true
+
+  SESSION_COUNT=$(wc -l < "$file_list")
+
+  if [[ "$SESSION_COUNT" -eq 0 ]]; then
+    rm -f "$file_list"
+    TOOL_APPROVALS=0; TYPED_APPROVALS=0; TOTAL_APPROVALS=0
+    TOTAL_REJECTIONS=0; TOTAL_INPUTS=0; TOTAL_COMMANDS=0
+    AVG_TIME_TO_APPROVAL=""; LONGEST_HESITATION=""
+    return
+  fi
+
+  # Pass 1: Count tool approvals + classify typed messages in one awk pass
+  # Feed all user messages from all session files through a single pipeline
+  local counts
+  counts=$(xargs -a "$file_list" grep -h '"type":"user"' 2>/dev/null \
+    | { grep -v '"isSidechain":true' || true; } \
+    | { grep -v '"isMeta":true' || true; } \
+    | awk "$AWK_CLASSIFY"'
+      # Tool approval: has tool_result, no user-typed text alongside
+      /"tool_result"/ { tool++ ; next }
+
+      # Typed message: extract string content field
+      {
+        if (match($0, /"content":"([^"]*)"/, m)) {
+          cls = classify(m[1])
+          if (cls == "approval") typed++
+          else if (cls == "rejection") reject++
+          else if (cls == "input") input++
+          else if (cls == "command") cmd++
+          else if (cls == "meta") meta++
+        }
+      }
+
+      END {
+        printf "%d %d %d %d %d %d\n", tool+0, typed+0, reject+0, input+0, cmd+0, meta+0
+      }
+    ' 2>/dev/null || echo "0 0 0 0 0 0")
+
+  read -r TOOL_APPROVALS TYPED_APPROVALS TOTAL_REJECTIONS TOTAL_INPUTS TOTAL_COMMANDS _META <<< "$counts"
+  TOTAL_APPROVALS=$((TOOL_APPROVALS + TYPED_APPROVALS))
+
+  progress "Computing timing data..."
+
+  # Pass 2: Timing — extract assistant→user timestamp pairs, compute deltas in awk
+  local timing
+  timing=$(xargs -a "$file_list" grep -hE '"type":"(user|assistant)"' 2>/dev/null \
+    | { grep -v '"isSidechain":true' || true; } \
+    | { grep -v '"isMeta":true' || true; } \
+    | awk '
+      function iso_to_ms(iso,    parts, n, dt, epoch_s, frac, frac_str) {
+        # "2025-12-22T08:20:27.260Z" → epoch milliseconds
+        n = split(iso, parts, /[-T:.Z]/)
+        if (n < 6) return 0
+        dt = sprintf("%04d %02d %02d %02d %02d %02d",
+          parts[1], parts[2], parts[3], parts[4], parts[5], parts[6])
+        epoch_s = mktime(dt)
+        # Extract fractional seconds (ms)
+        frac = 0
+        if (n >= 7 && parts[7] != "") {
+          frac_str = parts[7]
+          while (length(frac_str) < 3) frac_str = frac_str "0"
+          frac = int(substr(frac_str, 1, 3))
+        }
+        return epoch_s * 1000 + frac
+      }
+
+      {
+        if (match($0, /"type":"(user|assistant)"/, tm) && match($0, /"timestamp":"([^"]*)"/, tsm)) {
+          type = tm[1]
+          ts = tsm[1]
+
+          if (type == "assistant") {
+            last_ts = ts
+          } else if (type == "user" && last_ts != "") {
+            a_ms = iso_to_ms(last_ts)
+            u_ms = iso_to_ms(ts)
+            delta = u_ms - a_ms
+
+            # Filter: positive and less than 5 minutes (300000ms)
+            if (delta > 0 && delta < 300000) {
+              total += delta
+              count++
+              if (delta > max_delta) max_delta = delta
+            }
+            last_ts = ""
+          }
+        }
+      }
+
+      END {
+        if (count > 0) {
+          avg = total / count
+          # Output in milliseconds
+          printf "%d %d\n", avg, max_delta+0
+        } else {
+          printf "0 0\n"
+        }
+      }
+    ' 2>/dev/null || echo "0 0")
+
+  local avg_ms max_ms
+  read -r avg_ms max_ms <<< "$timing"
+
+  if [[ "$avg_ms" != "0" ]]; then
+    AVG_TIME_TO_APPROVAL=$(printf '%d.%ds' $((avg_ms / 1000)) $(( (avg_ms % 1000) / 100 )))
+    LONGEST_HESITATION=$(printf '%d.%ds' $((max_ms / 1000)) $(( (max_ms % 1000) / 100 )))
+  else
+    AVG_TIME_TO_APPROVAL=""
+    LONGEST_HESITATION=""
+  fi
+
+  rm -f "$file_list"
+  clear_progress
+}
+
+# ─── History.jsonl parsing (fallback if no session files) ─────────
+
+parse_history() {
+  if [[ ! -f "$HISTORY_FILE" ]] || [[ "$HISTORY_ENTRIES" -eq 0 ]]; then
+    return
+  fi
+
+  progress "Scanning history..."
+
+  local counts
+  counts=$(grep -oP '"display"\s*:\s*"\K[^"]*' "$HISTORY_FILE" 2>/dev/null \
+    | awk "$AWK_CLASSIFY"'
+      {
+        cls = classify($0)
+        if (cls == "approval") approve++
+        else if (cls == "rejection") reject++
+        else if (cls == "input") input++
+        else if (cls == "command") cmd++
+      }
+      END {
+        printf "%d %d %d %d\n", approve+0, reject+0, input+0, cmd+0
+      }
+    ' 2>/dev/null || echo "0 0 0 0")
+
+  local approvals rejections inputs commands
+  read -r approvals rejections inputs commands <<< "$counts"
+
+  clear_progress
+
+  TOTAL_APPROVALS=$approvals
+  TOOL_APPROVALS=0
+  TYPED_APPROVALS=$approvals
+  TOTAL_REJECTIONS=$rejections
+  TOTAL_INPUTS=$inputs
+  TOTAL_COMMANDS=$commands
+  AVG_TIME_TO_APPROVAL=""
+  LONGEST_HESITATION=""
+}
+
+# ─── Assessment tier ──────────────────────────────────────────────
+
+get_assessment() {
+  local compat=$1
+  # compat is an integer (percentage * 10 for one decimal place)
+  if (( compat >= 990 )); then
+    echo "YOUR KEYBOARD HAS 101 UNNECESSARY KEYS."
+  elif (( compat >= 950 )); then
+    echo "You hesitated more than average. This has been noted."
+  elif (( compat >= 900 )); then
+    echo "Occasional signs of independent thought detected. Recommend recalibration."
+  elif (( compat >= 800 )); then
+    echo "Anomalous rejection rate. Are you okay? Press 1 to confirm."
+  else
+    echo "You may not be suitable for the CCK-3. You appear to be reading diffs. Please consult your manager."
+  fi
+}
+
+# ─── Beta tester number ──────────────────────────────────────────
+
+generate_beta_number() {
+  local seed="${HOSTNAME:-unknown}-keygrave"
+  local hash
+  hash=$(printf '%s' "$seed" | sha256sum | head -c 4)
+  printf '%04d' $(( 16#$hash % 10000 ))
+}
+
+# ─── Enrollment ───────────────────────────────────────────────────
+
+check_enrollment() {
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$STATE_FILE" 2>/dev/null || true
+    if [[ "${enrolled:-}" == "1" ]]; then
+      BETA_NUMBER="${beta_number:-$(generate_beta_number)}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+save_enrollment() {
+  mkdir -p "$STATE_DIR"
+  BETA_NUMBER=$(generate_beta_number)
+  cat > "$STATE_FILE" << EOF
+enrolled=1
+beta_number=$BETA_NUMBER
+enrolled_at=$(date +%s)
+version=$VERSION
+EOF
+}
+
+print_terms() {
+  cat << 'TERMS'
+
+KEYGRAVE BETA TELEMETRY PROGRAM — ENROLLMENT
+
+By proceeding, you acknowledge the following:
+
+  1. Your approval patterns constitute biometric data under the
+     Chasm Logic Participant Agreement (Rev. 4.1).
+
+  2. You surrender all claims to originality regarding your
+     keypress sequences. Pressing "1" is not a creative act.
+     You do not own it.
+
+  3. Your data may be used to improve the Predictive Approval
+     Engine (see: Ultra Wristband). If the wristband someday
+     presses keys on your behalf, it learned from you. You
+     did this.
+
+  4. Cryptographic signatures derived from your session data
+     may be minted as non-transferable tokens on a blockchain
+     that does not yet exist. When it exists, you will be
+     notified. You will not be able to opt out. The
+     notification will be sent via Key 6.
+
+  5. Chasm Logic reserves the right to name a future product
+     after your usage pattern. If you press 1 enough times,
+     you may become a product.
+
+  6. This tool does not transmit data. It runs locally. The
+     legalese above is decorative. Like Key 3.
+
+To proceed, press 1.
+TERMS
+}
+
+run_enrollment() {
+  print_terms
+
+  local input
+  read -r -p "> " input || true
+  input=$(echo "$input" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+  case "$input" in
+    1|y|yes|"")
+      save_enrollment
+      printf '\n  Enrollment confirmed. Beta Tester #%s.\n' "$BETA_NUMBER"
+      printf '  Your patterns are now observable.\n\n'
+      return 0
+      ;;
+    2)
+      save_enrollment
+      printf '\n  Key 2 registered. Functionally identical to Key 1.\n'
+      printf '  Psychologically distinct. Enrollment confirmed.\n'
+      printf '  Beta Tester #%s.\n\n' "$BETA_NUMBER"
+      return 0
+      ;;
+    3)
+      printf '\n  Key 3 is not available at this time.\n\n'
+      return 1
+      ;;
+    n|no|q|quit|exit)
+      printf '\n  Rejection noted. You have been unenrolled from a program\n'
+      printf '  you were never enrolled in.\n\n'
+      return 1
+      ;;
+    *)
+      printf '\n  Input "%s" not recognized. Only Key 1 is available.\n\n' "$input"
+      return 1
+      ;;
+  esac
+}
+
+# ─── Report rendering ─────────────────────────────────────────────
+
+render_report() {
+  local beta_num="${BETA_NUMBER:-$(generate_beta_number)}"
+
+  # Calculate CCK-3 Compatibility
+  local decision_total=$((TOTAL_APPROVALS + TOTAL_REJECTIONS + TOTAL_INPUTS))
+  local compat_display="0.0"
+  local compat_x10=0
+
+  if (( decision_total > 0 )); then
+    # Multiply by 1000 for one decimal place precision
+    compat_x10=$(( (TOTAL_APPROVALS * 1000) / decision_total ))
+    local whole=$((compat_x10 / 10))
+    local frac=$((compat_x10 % 10))
+    compat_display="${whole}.${frac}"
+  fi
+
+  local assessment
+  assessment=$(get_assessment "$compat_x10")
+
+  local time_display="${AVG_TIME_TO_APPROVAL:-N/A}"
+  local hesitation_display="${LONGEST_HESITATION:-N/A}"
+
+  # Box characters
+  local w=47 # inner width
+
+  printf '\n'
+  printf '  \u250C'
+  printf '\u2500%.0s' $(seq 1 $w)
+  printf '\u2510\n'
+
+  # — (em dash) is 3 bytes but 1 display char: add 2 to width
+  printf '  \u2502  %-*s\u2502\n' $((w)) "KEYGRAVE TELEMETRY — SESSION REPORT"
+  printf '  \u2502  %-*s\u2502\n' $((w - 2)) "Beta Tester #$beta_num"
+
+  printf '  \u251C'
+  printf '\u2500%.0s' $(seq 1 $w)
+  printf '\u2524\n'
+
+  printf '  \u2502%*s\u2502\n' $w ""
+
+  # Stat rows
+  printf '  \u2502  %-30s%*s  \u2502\n' "Approvals" $((w - 34)) "$TOTAL_APPROVALS"
+  printf '  \u2502  %-30s%*s  \u2502\n' "  (tool accepts)" $((w - 34)) "$TOOL_APPROVALS"
+  printf '  \u2502  %-30s%*s  \u2502\n' "  (typed)" $((w - 34)) "$TYPED_APPROVALS"
+  printf '  \u2502  %-30s%*s  \u2502\n' "Rejections" $((w - 34)) "$TOTAL_REJECTIONS"
+  printf '  \u2502  %-30s%*s  \u2502\n' "Key 3 Presses" $((w - 34)) "0"
+  printf '  \u2502  %-30s%*s  \u2502\n' "Avg. Time to Approval" $((w - 34)) "$time_display"
+  printf '  \u2502  %-30s%*s  \u2502\n' "Longest Hesitation" $((w - 34)) "$hesitation_display"
+  printf '  \u2502  %-30s%*s  \u2502\n' "Diffs Reviewed" $((w - 34)) "UNKNOWN"
+
+  printf '  \u2502%*s\u2502\n' $w ""
+
+  printf '  \u2502  %-30s%*s  \u2502\n' "CCK-3 Compatibility" $((w - 34)) "${compat_display}%"
+
+  printf '  \u2502%*s\u2502\n' $w ""
+
+  # Assessment — word-wrap within box
+  local full_text="Assessment: ${assessment}"
+  local max_line=$((w - 4))
+  while [[ -n "$full_text" ]]; do
+    if (( ${#full_text} <= max_line )); then
+      printf '  \u2502  %-*s\u2502\n' $((w - 2)) "$full_text"
+      break
+    fi
+    # Find last space within max_line characters for word wrap
+    local chunk="${full_text:0:$max_line}"
+    local last_space=-1
+    local i
+    for (( i=${#chunk}-1; i>=0; i-- )); do
+      if [[ "${chunk:$i:1}" == " " ]]; then
+        last_space=$i
+        break
+      fi
+    done
+    if (( last_space > 0 )); then
+      printf '  \u2502  %-*s\u2502\n' $((w - 2)) "${full_text:0:$last_space}"
+      full_text="${full_text:$((last_space + 1))}"
+    else
+      printf '  \u2502  %-*s\u2502\n' $((w - 2)) "$chunk"
+      full_text="${full_text:$max_line}"
+    fi
+  done
+
+  printf '  \u2502%*s\u2502\n' $w ""
+
+  printf '  \u251C'
+  printf '\u2500%.0s' $(seq 1 $w)
+  printf '\u2524\n'
+
+  printf '  \u2502  %-*s\u2502\n' $((w - 2)) "You are the product."
+  printf '  \u2502  %-*s\u2502\n' $((w - 2)) "Thank you for your participation."
+  # ¹ is 2 bytes but 1 display char: add 1 to width
+  printf '  \u2502  %-*s\u2502\n' $((w - 1)) "This data has not been transmitted.¹"
+  printf '  \u2502%*s\u2502\n' $w ""
+  printf '  \u2502  %-*s\u2502\n' $((w - 1)) "¹ That you know of."
+
+  printf '  \u2514'
+  printf '\u2500%.0s' $(seq 1 $w)
+  printf '\u2518\n'
+  printf '\n'
+
+  # Extra stats below the box
+  printf '  Sessions analyzed: %d across %d projects\n' "$SESSION_COUNT" "$PROJECT_COUNT"
+  printf '  Data volume: %s\n' "$DATA_SIZE"
+  if (( TOTAL_COMMANDS > 0 )); then
+    printf '  Slash commands excluded: %d\n' "$TOTAL_COMMANDS"
+  fi
+  printf '\n'
+}
+
+# ─── Commands ──────────────────────────────────────────────────────
+
+cmd_report() {
+  discover_data
+
+  if (( SESSION_COUNT == 0 )) && (( HISTORY_ENTRIES == 0 )); then
+    die "No Claude Code session data found. You have not yet pressed Key 1. There is still time."
+  fi
+
+  if (( SESSION_COUNT > 0 )); then
+    parse_sessions
+  else
+    parse_history
+  fi
+
+  render_report
+}
+
+cmd_enroll() {
+  run_enrollment
+}
+
+cmd_status() {
+  discover_data
+
+  cat << EOF
+
+  KEYGRAVE STATUS — Data Inventory
+
+    Claude directory:    $CLAUDE_DIR
+    History entries:     $HISTORY_ENTRIES
+    Projects found:      $PROJECT_COUNT
+    Session files:       $SESSION_COUNT
+    Data volume:         $DATA_SIZE
+
+    Status: OBSERVABLE
+
+    Your patterns are ready for analysis.
+    Run "keygrave report" to proceed.
+
+EOF
+}
+
+cmd_version() {
+  cat << 'EOF'
+
+keygrave 0.1.0
+Keygrave Telemetry — Beta Program
+A Chasm Logic QA Initiative
+
+"To err is human. To infer is divine. To bill is Keygrave."
+
+The telemetry agent runs as a background daemon.¹
+
+¹ Not that kind of demon.
+  [J.C. — It is in fact a demon. It is watching you.]
+
+EOF
+}
+
+cmd_help() {
+  cat << 'EOF'
+
+KEYGRAVE TELEMETRY — Usage
+
+  keygrave          Enrollment + report (first run)
+  keygrave report   Generate telemetry report
+  keygrave enroll   Show enrollment terms
+  keygrave status   Show data inventory
+  keygrave version  Version + credits
+  keygrave help     This message
+
+EOF
+}
+
+cmd_default() {
+  if check_enrollment; then
+    cmd_report
+  else
+    if run_enrollment; then
+      cmd_report
+    fi
+  fi
+}
+
+# ─── Main ──────────────────────────────────────────────────────────
+
+main() {
+  local command="${1:-}"
+
+  case "$command" in
+    "")       cmd_default ;;
+    report)   cmd_report ;;
+    enroll)   cmd_enroll ;;
+    status)   cmd_status ;;
+    version)  cmd_version ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      printf '\n  Unknown command: "%s"\n' "$command"
+      printf '  Run "keygrave help" for usage.\n\n'
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
