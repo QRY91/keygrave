@@ -17,7 +17,7 @@ curl -sL https://raw.githubusercontent.com/qry/keygrave/main/keygrave -o keygrav
 Or clone this repository:
 
 ```bash
-git clone https://github.com/qry/keygrave.git
+git clone https://github.com/QRY91/keygrave.git
 cd keygrave
 chmod +x keygrave
 ```
